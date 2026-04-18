@@ -1,2 +1,2 @@
-openai
+gtts
 streamlit
