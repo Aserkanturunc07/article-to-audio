@@ -2,6 +2,7 @@ import re
 import io
 import os
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 from openai import OpenAI
 
@@ -90,17 +91,33 @@ def chunk_text(text: str, size: int = CHUNK_SIZE) -> list[str]:
 
 
 def text_to_audio(client: OpenAI, text: str, voice: str) -> bytes:
-    """Convert text to audio bytes using OpenAI TTS HD, chunking if needed."""
+    """Convert text to audio bytes using OpenAI TTS HD, chunks processed in parallel."""
     chunks = chunk_text(text)
-    audio_parts = []
-    for chunk in chunks:
+    total = len(chunks)
+
+    progress = st.progress(0, text=f"Generating audio (0/{total} parts)...")
+
+    results = {}
+
+    def convert_chunk(index, chunk):
         response = client.audio.speech.create(
             model="tts-1-hd",
             voice=voice,
             input=chunk,
         )
-        audio_parts.append(response.content)
-    return b"".join(audio_parts)
+        return index, response.content
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(convert_chunk, i, chunk): i for i, chunk in enumerate(chunks)}
+        completed = 0
+        for future in as_completed(futures):
+            index, audio = future.result()
+            results[index] = audio
+            completed += 1
+            progress.progress(completed / total, text=f"Generating audio ({completed}/{total} parts)...")
+
+    progress.empty()
+    return b"".join(results[i] for i in range(total))
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
