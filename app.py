@@ -3,24 +3,34 @@ import io
 import os
 from pathlib import Path
 import streamlit as st
-from gtts import gTTS
-
-LANGUAGES = {
-    "English": "en",
-    "Spanish": "es",
-    "French": "fr",
-    "German": "de",
-    "Italian": "it",
-    "Portuguese": "pt",
-    "Dutch": "nl",
-    "Japanese": "ja",
-    "Korean": "ko",
-    "Chinese (Mandarin)": "zh",
-}
+from openai import OpenAI
 
 # Detect if running on Streamlit Cloud (no local filesystem)
 IS_CLOUD = os.environ.get("STREAMLIT_SHARING_MODE") or os.environ.get("IS_CLOUD_DEPLOY")
 DEFAULT_SAVE_FOLDER = str(Path.home() / "Desktop" / "Article Audio")
+
+VOICES = {
+    "Onyx — deep, authoritative (Ray Porter-like)": "onyx",
+    "Fable — expressive, storytelling": "fable",
+    "Nova — warm, engaging": "nova",
+    "Alloy — neutral, clear": "alloy",
+    "Echo — smooth, conversational": "echo",
+    "Shimmer — soft, calm": "shimmer",
+}
+
+CHUNK_SIZE = 4000  # OpenAI TTS max is 4096 chars per request
+
+
+def get_openai_client():
+    # Try Streamlit secrets first (cloud), then env var, then error
+    try:
+        api_key = st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        st.error("OpenAI API key not found. Add it to Streamlit secrets as OPENAI_API_KEY.")
+        st.stop()
+    return OpenAI(api_key=api_key)
 
 
 def clean_text(text: str) -> str:
@@ -63,12 +73,42 @@ def slugify(title: str) -> str:
     return title.strip('_')[:80]
 
 
+def chunk_text(text: str, size: int = CHUNK_SIZE) -> list[str]:
+    """Split text into chunks at sentence boundaries, under `size` chars each."""
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunks, current = [], ""
+    for sentence in sentences:
+        if len(current) + len(sentence) + 1 <= size:
+            current += (" " if current else "") + sentence
+        else:
+            if current:
+                chunks.append(current)
+            current = sentence
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def text_to_audio(client: OpenAI, text: str, voice: str) -> bytes:
+    """Convert text to audio bytes using OpenAI TTS HD, chunking if needed."""
+    chunks = chunk_text(text)
+    audio_parts = []
+    for chunk in chunks:
+        response = client.audio.speech.create(
+            model="tts-1-hd",
+            voice=voice,
+            input=chunk,
+        )
+        audio_parts.append(response.content)
+    return b"".join(audio_parts)
+
+
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Article to Audio", page_icon="🎙️", layout="centered")
 
 st.title("🎙️ Article to Audio")
-st.caption("Paste any article and convert it to an MP3 audio file.")
+st.caption("Paste any article and convert it to a high-quality MP3 narration.")
 
 article_text = st.text_area(
     "Paste your article here",
@@ -76,11 +116,7 @@ article_text = st.text_area(
     placeholder="Paste the full text of your article here...",
 )
 
-col1, col2 = st.columns([2, 1])
-with col1:
-    language = st.selectbox("Language", list(LANGUAGES.keys()))
-with col2:
-    speed = st.selectbox("Speed", ["Normal", "Slow"])
+voice_label = st.selectbox("Voice", list(VOICES.keys()))
 
 if not IS_CLOUD:
     with st.expander("Save location (local)"):
@@ -92,21 +128,16 @@ if st.button("Convert to Audio", type="primary", use_container_width=True):
     if not article_text.strip():
         st.warning("Please paste some article text first.")
     else:
-        with st.spinner("Converting..."):
+        with st.spinner("Generating audio..."):
             cleaned = clean_text(article_text)
             if not cleaned:
                 st.error("No readable text found after cleanup.")
             else:
                 title = extract_title(article_text)
                 filename = slugify(title) + ".mp3"
-
-                lang_code = LANGUAGES[language]
-                slow = speed == "Slow"
-                tts = gTTS(text=cleaned, lang=lang_code, slow=slow)
-
-                audio_buffer = io.BytesIO()
-                tts.write_to_fp(audio_buffer)
-                audio_buffer.seek(0)
+                voice = VOICES[voice_label]
+                client = get_openai_client()
+                audio_bytes = text_to_audio(client, cleaned, voice)
 
                 # Save to local disk when running locally
                 if not IS_CLOUD and save_folder:
@@ -117,18 +148,16 @@ if st.button("Convert to Audio", type="primary", use_container_width=True):
                     while output_path.exists():
                         output_path = output_dir / (slugify(title) + f"_{counter}.mp3")
                         counter += 1
-                    with open(output_path, "wb") as f:
-                        f.write(audio_buffer.getvalue())
+                    output_path.write_bytes(audio_bytes)
                     st.success(f"Saved as **{output_path.name}**")
                     st.code(str(output_path), language=None)
                 else:
                     st.success(f"Ready: **{filename}**")
 
-                audio_buffer.seek(0)
-                st.audio(audio_buffer, format="audio/mp3")
+                st.audio(audio_bytes, format="audio/mp3")
                 st.download_button(
                     label="Download MP3",
-                    data=audio_buffer.getvalue(),
+                    data=audio_bytes,
                     file_name=filename,
                     mime="audio/mpeg",
                     use_container_width=True,
